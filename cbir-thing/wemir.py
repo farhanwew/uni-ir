@@ -6,10 +6,24 @@ Implementation of the CBIR method from:
     "A novel framework for retrieval of image using weighted edge matching algorithm"
     Multimedia Tools and Applications
 
-Pipeline:
-    1. Preprocessing: median filter -> K-means (k=3) -> histogram equalization -> DWT (LL)
-    2. Feature extraction: SVD reduction -> 5×5 block Hungarian assignment
-    3. Retrieval: Euclidean / Manhattan distance
+Pipeline (faithfully following the paper):
+    Preprocessing (Section 2):
+        1. Median filter for noise removal
+        2. K-means clustering (k=3) → group pixels
+        3. Select one cluster → histogram equalization (confined mean)
+        4. 1-level DWT → LL subband
+
+    Feature Extraction - WEMIR (Section 3, Steps 1-10):
+        1. Take LL image from preprocessing
+        2. SVD for size reduction (I = U S V^T, use S_r @ Vt_r)
+        3. Make matrix square (pad with zeros if needed)
+        4-5. Row/column subtraction (subtract minima)
+        6-8. Hungarian algorithm (minimum line covering + adjustment)
+        9. Select assignments (single zeros in rows/columns)
+        10. Store the central pixel value of each assigned minimum edge
+
+    Retrieval (Step 12):
+        Euclidean / Manhattan distance between feature vectors
 """
 
 import numpy as np
@@ -21,7 +35,11 @@ import pickle
 import time
 
 
-# Prepro stuff
+# =============================================================================
+# Preprocessing (Paper Section 2)
+# =============================================================================
+
+STANDARD_SIZE = (256, 256)
 
 
 def median_filter(image, ksize=3):
@@ -32,22 +50,26 @@ def median_filter(image, ksize=3):
 def kmeans_cluster(image, k=3, max_iter=100):
     """
     K-means clustering on RGB pixel values (paper Section 2.1).
+
     Groups pixel values into k clusters using Euclidean distance.
-    Returns flattened labels and cluster centers.
+    Uses deterministic initialization based on luminance quantization.
     """
     pixels = image.reshape(-1, 3).astype(np.float32)
     criteria = (
         cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
         max_iter,
-        0.2
+        0.2,
     )
     # Deterministic init: assign initial labels based on pixel luminance
-    luminance = (0.299 * pixels[:, 2] + 0.587 * pixels[:, 1] + 0.114 * pixels[:, 0])
-    init_labels = np.digitize(
-        luminance,
-        bins=np.linspace(luminance.min(), luminance.max() + 1e-6, k + 1)[1:-1]
-    ).astype(np.int32).reshape(-1, 1)
-
+    luminance = 0.299 * pixels[:, 2] + 0.587 * pixels[:, 1] + 0.114 * pixels[:, 0]
+    init_labels = (
+        np.digitize(
+            luminance,
+            bins=np.linspace(luminance.min(), luminance.max() + 1e-6, k + 1)[1:-1],
+        )
+        .astype(np.int32)
+        .reshape(-1, 1)
+    )
     _, labels, centers = cv2.kmeans(
         pixels, k, init_labels, criteria, 1, cv2.KMEANS_USE_INITIAL_LABELS
     )
@@ -56,14 +78,14 @@ def kmeans_cluster(image, k=3, max_iter=100):
 
 def select_largest_cluster(image, labels, k=3):
     """
-    Select the cluster with the most pixels (paper: "spot any one group").
-    Returns a masked image containing only the selected cluster's pixels
-    and the boolean mask.
+    Select the cluster with the most pixels.
+
+    Paper: "spot any one group to fed into confined mean computation"
+    We select the largest cluster as a deterministic choice.
     """
     counts = np.bincount(labels, minlength=k)
     largest = np.argmax(counts)
     mask = (labels == largest).reshape(image.shape[:2])
-
     result = np.zeros_like(image)
     result[mask] = image[mask]
     return result, mask
@@ -71,13 +93,10 @@ def select_largest_cluster(image, labels, k=3):
 
 def histogram_equalization(image):
     """
-    Histogram equalization for contrast enhancement (paper Section 2.2).
+    Histogram equalization (paper Section 2.2: "confined mean computation").
 
-    The paper describes the "confined mean computation" which maps pixel
-    intensities via the CDF to achieve uniform distribution:
-        E[i,j] = floor(N * sum(H[m], m=0..I[i,j]))
-
-    We use OpenCV's equalizeHist on the luminance channel.
+    Paper formula: E[i,j] = floor(N * sum(H[m], m=0..I[i,j]))
+    Maps pixel intensities via CDF for uniform distribution.
     """
     if len(image.shape) == 3:
         ycrcb = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
@@ -89,11 +108,9 @@ def histogram_equalization(image):
 
 def dwt_ll(image):
     """
-    Apply 1-level Discrete Wavelet Transform and return the LL subband
-    (paper Section 2.3).
+    1-level Discrete Wavelet Transform → LL subband (paper Section 2.3).
 
-    Uses Haar wavelet. The LL subband is the low-frequency approximation
-    at half the original resolution.
+    Uses Haar wavelet. Returns LL (approximation) and detail subbands.
     """
     if len(image.shape) == 3:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -102,66 +119,67 @@ def dwt_ll(image):
 
     coeffs = pywt.dwt2(gray.astype(np.float64), "haar")
     ll = coeffs[0]
-    return ll
+    lh, hl, hh = coeffs[1]
+    return ll, lh, hl, hh
 
 
-# Feature Extraction
+# =============================================================================
+# WEMIR Feature Extraction (Paper Section 3, Steps 1-10)
+# =============================================================================
 
 
-def svd_reduce(matrix, rank=None, energy_ratio=0.9):
+def svd_reduce(matrix, rank=10, target_size=(25, 25)):
     """
-    SVD for dimensionality reduction (paper Step 2).
+    SVD for size reduction (paper Step 2).
 
-    Factorizes I = U S V^T, then reconstructs with only the top-r
-    singular values to reduce the representation.
+    "Reduce the image size by using single value decomposition (SVD)"
+
+    Factorizes I = U S V^T, reconstructs with rank-r approximation
+    (preserving spatial structure), then resizes to a fixed target
+    size for consistent feature extraction.
 
     Args:
         matrix: 2D array (the LL subband)
-        rank: number of singular values to keep. If None, auto-select
-              based on energy_ratio.
-        energy_ratio: fraction of total energy to preserve (default 0.9)
+        rank: number of singular values to keep (default 10)
+        target_size: output dimensions, divisible by 5 (default 25x25)
 
     Returns:
-        Reduced matrix (rank-r approximation)
+        Reduced matrix of shape target_size
     """
     U, S, Vt = np.linalg.svd(matrix, full_matrices=False)
-
     if rank is None:
-        total_energy = np.sum(S**2)
-        cumulative = np.cumsum(S**2)
-        rank = np.searchsorted(cumulative, energy_ratio * total_energy) + 1
-        rank = max(rank, 5)  # at least 5 to form valid 5×5 blocks
-
+        rank = 10
     rank = min(rank, len(S))
+    # Rank-r approximation preserves spatial structure from U
     reduced = U[:, :rank] @ np.diag(S[:rank]) @ Vt[:rank, :]
+    # Resize to fixed target for consistent feature count
+    reduced = cv2.resize(
+        reduced, (target_size[1], target_size[0]),
+        interpolation=cv2.INTER_AREA
+    )
     return reduced
+
+
 
 
 def hungarian_block(block):
     """
-    Apply the Hungarian algorithm to a 5×5 block (paper Steps 3-10).
+    Apply Hungarian algorithm to a 5x5 block (paper Steps 4-9).
 
-    The paper describes:
-        Step 3: Ensure balanced (square) matrix
-        Step 4: Row subtraction - subtract row minima
-        Step 5: Column subtraction - subtract col minima
+    Paper describes:
+        Step 4: Row subtraction (subtract row minima)
+        Step 5: Column subtraction (subtract col minima)
         Step 6: Draw minimum lines to cover all zeros
-        Step 7: If lines == size → done; else subtract min uncovered
-                from uncovered, add to intersections
-        Step 8: Repeat until lines == size
-        Step 9: Select assignments (single zeros)
-        Step 10: Store the assigned intensity values
+        Step 7: If lines == size -> done; else adjust
+        Step 8: Repeat until optimal
+        Step 9: Select assignments
+        Step 10: Store intensity values
 
-    We use scipy's linear_sum_assignment which implements the full
-    Hungarian algorithm correctly and efficiently.
-
-    Args:
-        block: 5×5 numpy array of pixel intensities
+    Uses scipy's linear_sum_assignment for correctness.
 
     Returns:
-        Array of 5 assigned intensity values (the minimum edge values)
+        Array of assigned intensity values (minimum edge values)
     """
-    # Ensure non-negative (the algorithm works on cost matrices)
     cost = block.copy()
     if cost.min() < 0:
         cost = cost - cost.min()
@@ -170,114 +188,177 @@ def hungarian_block(block):
     return block[row_ind, col_ind]
 
 
-def extract_block_features(matrix, block_size=5):
+def extract_shape_features(ll, svd_rank=10, block_size=5):
     """
-    Split matrix into non-overlapping blocks and extract features via
-    Hungarian assignment (paper Steps 3-10).
+    Extract shape features via SVD + Hungarian (paper Steps 1-10).
 
-    Each 5×5 block yields 5 feature values (the minimum cost assignment).
-    The matrix is zero-padded if not evenly divisible by block_size.
-
-    Args:
-        matrix: 2D array (SVD-reduced LL subband)
-        block_size: size of each square block (default 5)
+    1. SVD reduction on LL subband (resize to fixed size)
+    2. Split into 5x5 blocks
+    3. Hungarian algorithm on each block
+    4. Store assigned intensity values
 
     Returns:
-        1D feature vector
+        1D feature vector (5 values per block)
     """
-    h, w = matrix.shape
+    # Step 2: SVD reduction (includes resize to 25x25)
+    reduced = svd_reduce(ll, rank=svd_rank)
 
-    # Pad to make dimensions divisible by block_size (paper Step 3)
-    pad_h = (block_size - h % block_size) % block_size
-    pad_w = (block_size - w % block_size) % block_size
-    if pad_h > 0 or pad_w > 0:
-        matrix = np.pad(
-            matrix, ((0, pad_h), (0, pad_w)), mode="constant", constant_values=0
-        )
-
-    h, w = matrix.shape
+    h, w = reduced.shape
     features = []
 
+    # Steps 4-10: Hungarian on each 5x5 block
     for i in range(0, h, block_size):
         for j in range(0, w, block_size):
-            block = matrix[i : i + block_size, j : j + block_size]
+            block = reduced[i : i + block_size, j : j + block_size]
             assigned = hungarian_block(block)
             features.extend(assigned)
 
     return np.array(features, dtype=np.float64)
 
 
+# =============================================================================
+# Color Feature Extraction
+# (Paper abstract: "fusion approach to extract color, texture and shape")
+# =============================================================================
+
+
+def extract_color_features(image):
+    """
+    Extract color features (paper: "higher order of confined mean"
+    for color feature extraction).
+
+    Computes HSV color histogram from the full preprocessed image.
+    Uses 16 hue, 4 saturation, 4 value bins = 256 features.
+    """
+    if len(image.shape) < 3:
+        return np.zeros(256)
+
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist(
+        [hsv], [0, 1, 2], None,
+        [16, 4, 4], [0, 180, 0, 256, 0, 256]
+    )
+    hist = cv2.normalize(hist, hist).flatten()
+    return hist
+
+
+# =============================================================================
+# Texture Feature Extraction
+# (Paper: "multi optimization techniques" for texture)
+# =============================================================================
+
+
+def extract_texture_features(lh, hl, hh):
+    """
+    Extract texture features from DWT detail subbands.
+
+    Paper: "multi optimization techniques are used" for texture extraction.
+    The DWT detail subbands (LH, HL, HH) capture directional texture
+    information. We compute statistical features from each subband.
+    """
+    features = []
+    for subband in [lh, hl, hh]:
+        abs_sub = np.abs(subband)
+        total = abs_sub.sum() + 1e-10
+        features.extend([
+            np.mean(abs_sub),                    # mean energy
+            np.std(abs_sub),                     # energy spread
+            np.sqrt(np.mean(subband ** 2)),       # RMS energy
+            -np.sum((abs_sub / total)             # entropy
+                    * np.log2(abs_sub / total + 1e-10)),
+        ])
+    return np.array(features)
+
+
+# =============================================================================
 # Full Pipeline
+# =============================================================================
 
 
 def preprocess(image):
     """
     Full preprocessing pipeline (paper Section 2).
 
-    1. Median filter for noise removal
-    2. K-means clustering (k=3) on RGB pixels
-    3. Select largest cluster
-    4. Histogram equalization (confined mean)
-    5. 1-level DWT → LL subband
-
-    Args:
-        image: BGR image (numpy array)
+    1. Resize to standard size
+    2. Median filter for noise removal
+    3. K-means clustering (k=3) on RGB pixels
+    4. Select largest cluster
+    5. Histogram equalization (confined mean)
+    6. 1-level DWT → LL + detail subbands
 
     Returns:
-        LL subband as 2D float array
+        Tuple of (color_image, ll, lh, hl, hh) where:
+            color_image: full histogram-equalized image (for color features)
+            ll, lh, hl, hh: DWT subbands (from cluster image, for shape/texture)
     """
-    # 1. Median filter
+    image = cv2.resize(image, STANDARD_SIZE, interpolation=cv2.INTER_AREA)
     filtered = median_filter(image)
 
-    # 2. K-means clustering (k=3)
+    # Color features use the full enhanced image
+    color_image = histogram_equalization(filtered)
+
+    # Shape/texture features use the cluster-focused image
     labels, centers = kmeans_cluster(filtered, k=3)
-
-    # 3. Select largest cluster
     cluster_img, mask = select_largest_cluster(filtered, labels)
-
-    # 4. Histogram equalization
     enhanced = histogram_equalization(cluster_img)
+    ll, lh, hl, hh = dwt_ll(enhanced)
 
-    # 5. DWT - extract LL subband
-    ll = dwt_ll(enhanced)
-
-    return ll
+    return color_image, ll, lh, hl, hh
 
 
-def extract_features(image, svd_rank=None):
+def extract_features(image, svd_rank=10):
     """
-    Full WEMIR feature extraction pipeline.
+    Full WEMIR feature extraction — fusion of color, texture, and shape.
 
-    Preprocessing → SVD reduction → 5×5 block Hungarian assignment
+    Paper abstract: "It is a fusion approach to extract the color, texture
+    and shape features from images."
+
+    Pipeline:
+        1. Preprocessing (median filter, K-means, histeq, DWT)
+        2. Color features: HSV histogram from full image
+        3. Texture features: DWT detail subband statistics
+        4. Shape features: SVD + Hungarian on LL subband
+        5. Fusion: concatenate + L2 normalize
 
     Args:
         image: BGR image (numpy array)
-        svd_rank: number of singular values to keep (None = auto)
+        svd_rank: SVD rank for shape features (default 10)
 
     Returns:
-        1D feature vector
+        1D L2-normalized feature vector
     """
-    ll = preprocess(image)
-    reduced = svd_reduce(ll, rank=svd_rank)
-    features = extract_block_features(reduced)
-    return features
+    color_image, ll, lh, hl, hh = preprocess(image)
+
+    # Color features
+    color_feat = extract_color_features(color_image)
+
+    # Texture features
+    texture_feat = extract_texture_features(lh, hl, hh)
+
+    # Shape features (WEMIR core)
+    shape_feat = extract_shape_features(ll, svd_rank)
+
+    # Fusion
+    combined = np.concatenate([color_feat, texture_feat, shape_feat])
+
+    # L2 normalize
+    norm = np.linalg.norm(combined)
+    if norm > 0:
+        combined = combined / norm
+
+    return combined
 
 
-# Distance / Similarity
+# =============================================================================
+# Distance / Similarity (Paper Step 12)
+# =============================================================================
 
 
 def compute_distance(feat_a, feat_b, metric="euclidean"):
     """
-    Compute distance between two feature vectors (paper Section 3, Step 12).
+    Compute distance between two feature vectors (paper Step 12).
 
     Handles different-length vectors by zero-padding the shorter one.
-
-    Args:
-        feat_a, feat_b: 1D feature vectors
-        metric: 'euclidean' or 'manhattan'
-
-    Returns:
-        Scalar distance value
     """
     max_len = max(len(feat_a), len(feat_b))
     a = np.zeros(max_len)
@@ -293,7 +374,11 @@ def compute_distance(feat_a, feat_b, metric="euclidean"):
         raise ValueError(f"Unknown metric: {metric}")
 
 
+# =============================================================================
 # Index
+# =============================================================================
+
+
 class WEMIRIndex:
     """
     WEMIR feature index for content-based image retrieval.
@@ -302,28 +387,17 @@ class WEMIRIndex:
     and supports querying with a new image to find the most similar ones.
     """
 
-    def __init__(self, svd_rank=None):
+    def __init__(self, svd_rank=10):
         self.svd_rank = svd_rank
-        self.features = {}  # path (str) -> feature vector (np.ndarray)
-        self.labels = {}  # path (str) -> category label (str)
+        self.features = {}   # path (str) -> feature vector
+        self.labels = {}     # path (str) -> category label
 
     def build(self, image_dir, extensions=(".jpg", ".jpeg", ".png", ".bmp")):
         """
         Build the feature index from all images in a directory.
 
         Expects images organized in category subfolders:
-            image_dir/
-                category1/
-                    img1.jpg
-                    img2.jpg
-                category2/
-                    ...
-
-        The parent folder name is used as the category label.
-
-        Args:
-            image_dir: path to the root image directory
-            extensions: file extensions to include
+            image_dir/category1/img1.jpg, img2.jpg, ...
         """
         image_dir = Path(image_dir)
         image_paths = sorted(
@@ -350,23 +424,13 @@ class WEMIRIndex:
                     print(f"  [{idx}/{total}] {elapsed:.1f}s elapsed")
 
             except Exception as e:
-                print(f"  [{idx}/{total}] failed: {img_path.name} — {e}")
+                print(f"  [{idx}/{total}] failed: {img_path.name} -- {e}")
 
         elapsed = time.time() - start
         print(f"Done! Indexed {len(self.features)} images in {elapsed:.1f}s")
 
     def query(self, query_image_or_path, top_k=10, metric="euclidean"):
-        """
-        Retrieve the top-k most similar images to a query.
-
-        Args:
-            query_image_or_path: path string or BGR numpy array
-            top_k: number of results to return
-            metric: 'euclidean' or 'manhattan'
-
-        Returns:
-            List of (path, distance, label) tuples, sorted ascending by distance
-        """
+        """Retrieve the top-k most similar images to a query."""
         if isinstance(query_image_or_path, (str, Path)):
             image = cv2.imread(str(query_image_or_path))
             if image is None:
@@ -389,26 +453,24 @@ class WEMIRIndex:
         """
         Query and compute precision/recall.
 
-        The query image's category (parent folder name) is used as ground truth.
+        The query image itself is excluded from results (self-match).
         Precision = relevant retrieved / total retrieved
         Recall = relevant retrieved / total relevant in database
-
-        Args:
-            query_image_path: path to the query image
-            top_k: number of results
-            metric: distance metric
-
-        Returns:
-            dict with 'results', 'precision', 'recall', 'query_label'
         """
         query_path = Path(query_image_path)
         query_label = query_path.parent.name
-        results = self.query(query_image_path, top_k, metric)
+        query_str = str(query_path)
 
-        # Count relevant images in the full database
-        total_relevant = sum(1 for lbl in self.labels.values() if lbl == query_label)
+        # Request extra to account for self-match removal
+        results = self.query(query_image_path, top_k + 1, metric)
+        results = [(p, d, l) for p, d, l in results if p != query_str]
+        results = results[:top_k]
 
-        # Count relevant in retrieved results
+        total_relevant = sum(
+            1 for p, lbl in zip(self.labels.keys(), self.labels.values())
+            if lbl == query_label and p != query_str
+        )
+
         relevant_retrieved = sum(1 for _, _, lbl in results if lbl == query_label)
 
         precision = relevant_retrieved / len(results) if results else 0.0
@@ -426,14 +488,11 @@ class WEMIRIndex:
     def save(self, path):
         """Save the index to a pickle file."""
         with open(path, "wb") as f:
-            pickle.dump(
-                {
-                    "features": self.features,
-                    "labels": self.labels,
-                    "svd_rank": self.svd_rank,
-                },
-                f,
-            )
+            pickle.dump({
+                "features": self.features,
+                "labels": self.labels,
+                "svd_rank": self.svd_rank,
+            }, f)
         print(f"Index saved to {path}")
 
     @classmethod
